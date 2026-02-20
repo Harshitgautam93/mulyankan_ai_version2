@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-
+import sys
 from supabase import create_client
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
@@ -8,7 +8,9 @@ from langchain_community.vectorstores import SupabaseVectorStore
 # ===============================
 # Environment Setup
 # ===============================
-load_dotenv()
+# Add parent directory to path to find .env in project root
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(project_root, ".env"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -29,161 +31,148 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 # ===============================
-# Store Guideline Logic
+# Store Guideline Logic (Direct Insert - Bypassing LangChain Vector Store)
 # ===============================
 def store_guideline(question_text: str, solution_text: str):
     """
     Stores the Question as searchable content and Solution in metadata.
-    This allows us to find the right assignment based on the question.
+    Direct insert method to avoid LangChain SupabaseVectorStore schema issues.
     """
     try:
-        SupabaseVectorStore.from_texts(
-            texts=[question_text], 
-            embedding=embeddings,
-            client=supabase,
-            table_name="assignments",
-            query_name="match_assignments",
-            metadatas=[{"solution": solution_text}], # Store the actual answer here
-        )
+        import json
+        from datetime import datetime
+        
+        # Generate embeddings for the question text
+        question_embedding = embeddings.embed_query(question_text)
+        
+        # Prepare the data for direct insert
+        data = {
+            "content": question_text,
+            "metadata": json.dumps({"solution": solution_text, "type": "guideline"}),
+            "embedding": question_embedding,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Direct insert into assignments table
+        result = supabase.table("assignments").insert(data).execute()
+        
+        print(f"✅ Guideline stored successfully")
         return "✅ Question & Solution Indexed Successfully"
     except Exception as e:
+        print(f"[ERROR] Supabase insert failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"Supabase insert failed: {e}")
 
 # ===============================
-# Retrieve Relevant Guideline
+# Retrieve Relevant Guideline (Updated for Direct Insert Format)
 # ===============================
 def retrieve_relevant_guideline(query_text: str):
     try:
         print(f"--- DEBUG: Searching for Topic: '{query_text}' ---")
         
-        # Ensure the vector store is initialized with the client
-        vector_store = SupabaseVectorStore(
-            client=supabase,
-            embedding=embeddings,
-            table_name="assignments",
-            query_name="match_assignments"
-        )
+        # Generate embedding for the query
+        query_embedding = embeddings.embed_query(query_text)
         
-        # FIX: Use a lower-level search or ensure the match_assignments 
-        # RPC is returning the correct JSON structure.
-        results = vector_store.similarity_search(
-            query=query_text,
-            k=1
-        )
-
-        # Try to extract solution from vector search result
-        if results:
-            try:
-                solution = None
-                if hasattr(results[0], "metadata"):
-                    solution = results[0].metadata.get("solution")
-                # fallback if metadata is stored differently
-                if not solution and hasattr(results[0], "metadata") and isinstance(results[0].metadata, dict):
-                    # try common alternate keys
-                    for key in ("answer", "solution_text", "sol"):
-                        if key in results[0].metadata:
-                            solution = results[0].metadata[key]
-                            break
-
-                if solution:
-                    print(f"--- DEBUG: Match Found via vector search ---")
-                    return solution
-            except Exception as e:
-                print(f"--- DEBUG: Failed extracting metadata from vector result: {e}")
-
-        # FALLBACK: If vector search returned nothing useful, query Supabase rows directly
-        print("--- DEBUG: Vector search returned no usable result, attempting SQL fallback... ---")
+        # Use Supabase RPC for vector similarity search
         try:
-            resp = supabase.table("assignments").select("*").limit(50).execute()
-            # resp may be an object with .data or a dict
-            rows = getattr(resp, "data", None) or (resp.get("data") if isinstance(resp, dict) else None)
-
-            def _extract_solution_from_row(row: dict):
-                if not isinstance(row, dict):
-                    return None
-                # common metadata keys used by vectorstores
-                for meta_key in ("metadatas", "metadata", "meta", "metadata"):
-                    md = row.get(meta_key)
-                    if isinstance(md, dict):
-                        for key in ("solution", "answer", "solution_text"):
-                            if key in md:
-                                return md.get(key)
-                    if isinstance(md, str):
-                        try:
-                            import json
-                            mdj = json.loads(md)
-                            for key in ("solution", "answer"):
-                                if key in mdj:
-                                    return mdj.get(key)
-                        except Exception:
-                            pass
-                # top-level fallbacks
-                for key in ("solution", "answer", "solution_text"):
-                    if key in row:
-                        return row.get(key)
-                return None
-
-            if rows:
-                for r in rows:
-                    s = _extract_solution_from_row(r)
-                    if s:
-                        print("--- DEBUG: Match Found via SQL fallback ---")
-                        return s
-            else:
-                print("--- DEBUG: No rows returned from assignments table ---")
-
-            return None
+            results = supabase.rpc(
+                "match_assignments",
+                {
+                    "query_embedding": query_embedding,
+                    "match_count": 1,
+                    "similarity_threshold": 0.0
+                }
+            ).execute()
+            
+            rows = getattr(results, "data", None) or (results.get("data") if isinstance(results, dict) else None)
+            
+            if rows and isinstance(rows, list) and len(rows) > 0:
+                row = rows[0]
+                # Extract solution from metadata JSON
+                try:
+                    import json
+                    metadata = row.get("metadata")
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    if isinstance(metadata, dict):
+                        solution = metadata.get("solution")
+                        if solution:
+                            print(f"--- DEBUG: Match Found via vector RPC ---")
+                            return solution
+                except Exception as e:
+                    print(f"--- DEBUG: Failed extracting solution from RPC result: {e}")
         except Exception as e:
-            print(f"--- DEBUG: SQL fallback search failed: {e}")
-            return None
-
-    except AttributeError as e:
-        if "params" in str(e):
-            print("--- ERROR: Supabase SDK version mismatch. ---")
-            print("Check that your match_assignments RPC is correctly defined in Supabase.")
-        # Attempt SQL fallback when vectorstore RPC or SDK doesn't match
+            print(f"--- DEBUG: Vector RPC call failed: {e}")
+        
+        # FALLBACK: Direct SQL query to assignments table
+        print("--- DEBUG: Attempting SQL fallback...")
         try:
-            resp = supabase.table("assignments").select("*").limit(50).execute()
+            resp = supabase.table("assignments").select("*").limit(10).execute()
             rows = getattr(resp, "data", None) or (resp.get("data") if isinstance(resp, dict) else None)
+            
             if rows:
-                for r in rows:
-                    # try to extract solution from common locations
-                    md = None
-                    if isinstance(r, dict):
-                        md = r.get("metadata") or r.get("metadatas") or r.get("meta")
-                    if isinstance(md, dict) and md.get("solution"):
-                        print("--- DEBUG: Match Found via SQL fallback (AttributeError path) ---")
-                        return md.get("solution")
-                    if isinstance(r, dict) and r.get("solution"):
-                        print("--- DEBUG: Match Found via SQL fallback (AttributeError path) ---")
-                        return r.get("solution")
-            print("--- DEBUG: SQL fallback (AttributeError path) found nothing ---")
+                for row in rows:
+                    try:
+                        import json
+                        metadata = row.get("metadata")
+                        if isinstance(metadata, str):
+                            metadata = json.loads(metadata)
+                        if isinstance(metadata, dict):
+                            solution = metadata.get("solution")
+                            if solution:
+                                print(f"--- DEBUG: Match Found via SQL fallback ---")
+                                return solution
+                    except Exception as e:
+                        pass
+            
+            print("--- DEBUG: SQL fallback found no solutions ---")
             return None
-        except Exception as ex:
-            print(f"--- DEBUG: SQL fallback after AttributeError failed: {ex}")
+            
+        except Exception as e:
+            print(f"--- DEBUG: SQL fallback failed: {e}")
             return None
+    
     except Exception as e:
-        print(f"--- DEBUG: Search failed: {e} ---")
+        print(f"--- DEBUG: Guideline retrieval failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 # ===============================
-# Store Guideline with Metadata (Updated)
+# Store Guideline with Metadata (Updated to Direct Insert)
 # ===============================
 def store_guideline_with_metadata(extracted_text: str, question_title: str):
-    """Stores PDF text and links the title in metadata."""
+    """Stores PDF text and links the title in metadata using direct insert."""
     try:
-        SupabaseVectorStore.from_texts(
-            texts=[extracted_text],
-            embedding=embeddings,
-            client=supabase,
-            table_name="assignments",
-            query_name="match_assignments",
-            metadatas=[{"question": question_title, "solution": extracted_text}]
-        )
+        import json
+        from datetime import datetime
+        
+        # Generate embeddings
+        text_embedding = embeddings.embed_query(extracted_text)
+        
+        # Prepare data
+        data = {
+            "content": extracted_text,
+            "metadata": json.dumps({
+                "question": question_title,
+                "solution": extracted_text,
+                "type": "guideline"
+            }),
+            "embedding": text_embedding,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Direct insert
+        supabase.table("assignments").insert(data).execute()
+        
+        print(f"✅ Guideline with metadata stored successfully")
         return True
     except Exception as e:
-        print(f"Ingestion Error: {e}")
+        print(f"[ERROR] Ingestion Error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -199,23 +188,64 @@ def retrieve_with_fallback(query_topic: str):
 # ===============================
 # Save Evaluation Result
 # ===============================
-def save_evaluation_result(topic: str, student_name: str, evaluation_data: dict, student_roll: str = None):
-    """Saves the final LLM grade to the evaluations table in Supabase."""
+def save_evaluation_result(topic: str, student_name: str, evaluation_data: dict, student_roll: str = None, student_answer: str = None):
+    """Saves the final LLM grade and all detailed feedback to Supabase."""
     try:
         from datetime import datetime
-        supabase.table("evaluations").insert({
+        import json
+        
+        # Prepare evaluation data with all available fields
+        eval_record = {
             "topic": topic,
             "student_name": student_name,
-            "student_roll": student_roll,
             "score": evaluation_data.get("score"),
             "grade": evaluation_data.get("grade"),
             "feedback": evaluation_data.get("feedback"),
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-        print(f"✅ Evaluation saved for {student_name} (Roll: {student_roll}) on topic '{topic}'")
+            "topic_diagnostic": evaluation_data.get("topic_diagnostic", ""),
+            "bridge_guidance": evaluation_data.get("bridge_guidance", ""),
+            "created_at": datetime.utcnow().isoformat(),
+            # Complex JSON fields
+            "rubric_breakdown": json.dumps(evaluation_data.get("rubric_breakdown", [])),
+            "missing_concepts": json.dumps(evaluation_data.get("missing_concepts", [])),
+            "suggested_resources": json.dumps(evaluation_data.get("suggested_resources", [])),
+            "evaluation_metadata": json.dumps(evaluation_data.get("metadata", {}))
+        }
+        
+        # Add roll number and student answer if provided
+        if student_roll:
+            eval_record["student_roll"] = student_roll
+        if student_answer:
+            eval_record["student_answer"] = student_answer
+        
+        # Insert into evaluations table
+        try:
+            result = supabase.table("evaluations").insert(eval_record).execute()
+        except Exception as e:
+            # FALLBACK: If new columns are missing, try saving only primary fields
+            err_str = str(e)
+            if any(col in err_str for col in ["student_roll", "student_answer", "rubric_breakdown"]):
+                print("[DEBUG] Extra columns missing in DB, falling back to basic fields")
+                basic_record = {
+                    "topic": topic,
+                    "student_name": student_name,
+                    "score": evaluation_data.get("score"),
+                    "grade": evaluation_data.get("grade"),
+                    "feedback": evaluation_data.get("feedback"),
+                    "created_at": eval_record["created_at"]
+                }
+                if student_roll and "student_roll" not in err_str:
+                    basic_record["student_roll"] = student_roll
+                result = supabase.table("evaluations").insert(basic_record).execute()
+            else:
+                raise e
+        
+        print(f"✅ Full Evaluation SAVED to Supabase: {student_name} | Topic: '{topic}'")
+        clear_analytics_cache()
         return True
     except Exception as e:
-        print(f"Error saving evaluation: {e}")
+        print(f"[ERROR] Error saving evaluation: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -230,19 +260,54 @@ def clear_analytics_cache():
 
 
 # ===============================
+# Data Management Functions
+# ===============================
+def delete_all_evaluations():
+    """Wipes all records from the evaluations table."""
+    try:
+        # Using a filter that matches all (id > 0)
+        supabase.table("evaluations").delete().gt("id", 0).execute()
+        clear_analytics_cache()
+        return True
+    except Exception as e:
+        print(f"[ERROR] Delete all failed: {e}")
+        return False
+
+def delete_mock_data():
+    """Deletes the automatically inserted mock data (from Feb 4th)."""
+    try:
+        # Sample data was inserted with '2026-02-04'
+        supabase.table("evaluations").delete().lt("created_at", "2026-02-10").execute()
+        clear_analytics_cache()
+        return True
+    except Exception as e:
+        print(f"[ERROR] Delete mock data failed: {e}")
+        return False
+
+
+# ===============================
 # Analytics Functions
 # ===============================
 def get_all_evaluations():
     """Retrieve all evaluation records from database."""
     try:
-        # SELECT only necessary fields to improve performance
-        resp = supabase.table("evaluations").select("id, created_at, topic, student_name, student_roll, score, grade, feedback").order("created_at", desc=True).execute()
-        rows = getattr(resp, "data", None) or (resp.get("data") if isinstance(resp, dict) else None)
-        if rows and not isinstance(rows, list):
-            rows = [rows] if rows else []
-        return rows if rows else []
+        # Fetch everything (*) to ensure new columns are available in the result
+        resp = supabase.table("evaluations").select("*").order("created_at", desc=True).execute()
+
+        rows = getattr(resp, "data", None)
+        if rows is None:
+            # Try dictionary access if it's not an object
+            rows = resp.get("data") if isinstance(resp, dict) else []
+        
+        # Ensure it's a list
+        if rows is not None and not isinstance(rows, list):
+            rows = [rows]
+
+        actual_rows = rows if rows else []
+        print(f"[DEBUG] get_all_evaluations: Retrieved {len(actual_rows)} records")
+        return actual_rows
     except Exception as e:
-        print(f"Error retrieving evaluations: {e}")
+        print(f"[ERROR] Error retrieving evaluations: {e}")
         import traceback
         traceback.print_exc()
         return []
@@ -256,21 +321,27 @@ def get_total_evaluations():
 
 def get_average_score():
     """Calculate average score across all evaluations."""
-    evaluations = get_all_evaluations()
-    if not evaluations:
+    try:
+        evaluations = get_all_evaluations()
+        if not evaluations:
+            return 0
+        
+        total_score = 0
+        count = 0
+        for eval_record in evaluations:
+            try:
+                score = float(eval_record.get("score", 0))
+                total_score += score
+                count += 1
+            except (ValueError, TypeError):
+                pass
+        
+        result = round(total_score / count, 2) if count > 0 else 0
+        print(f"[DEBUG] get_average_score: {result} ({count} scores)")
+        return result
+    except Exception as e:
+        print(f"[ERROR] get_average_score failed: {e}")
         return 0
-    
-    total_score = 0
-    count = 0
-    for eval_record in evaluations:
-        try:
-            score = float(eval_record.get("score", 0))
-            total_score += score
-            count += 1
-        except (ValueError, TypeError):
-            pass
-    
-    return round(total_score / count, 2) if count > 0 else 0
 
 
 def get_grade_distribution():
@@ -314,7 +385,7 @@ def get_topic_performance():
 
 
 def get_student_performance():
-    """Get average score by student."""
+    """Get best (max) score by student."""
     evaluations = get_all_evaluations()
     student_data = {}
     
@@ -326,19 +397,17 @@ def get_student_performance():
             score = 0
         
         if student not in student_data:
-            student_data[student] = {"scores": [], "count": 0}
+            student_data[student] = []
         
-        student_data[student]["scores"].append(score)
-        student_data[student]["count"] += 1
+        student_data[student].append(score)
     
-    # Calculate averages
-    student_avg = {}
-    for student, data in student_data.items():
-        avg = sum(data["scores"]) / len(data["scores"]) if data["scores"] else 0
-        student_avg[student] = round(avg, 2)
+    # Calculate Best Score (Max)
+    student_best = {}
+    for student, scores in student_data.items():
+        student_best[student] = max(scores) if scores else 0
     
-    # Sort by score descending
-    return dict(sorted(student_avg.items(), key=lambda x: x[1], reverse=True))
+    # Sort by score descending (Top Rank = Best Score)
+    return dict(sorted(student_best.items(), key=lambda x: x[1], reverse=True))
 
 
 def get_evaluations_by_topic():
@@ -378,13 +447,21 @@ def get_top_students(limit=10):
 
 def get_evaluations_summary():
     """Get summary statistics."""
-    evaluations = get_all_evaluations()
-    return {
-        "total": len(evaluations),
-        "avg_score": get_average_score(),
-        "unique_students": len(set(e.get("student_name", "") for e in evaluations)),
-        "unique_topics": len(set(e.get("topic", "") for e in evaluations))
-    }
+    try:
+        evaluations = get_all_evaluations()
+        summary = {
+            "total": len(evaluations),
+            "avg_score": get_average_score(),
+            "unique_students": len(set(e.get("student_name", "") for e in evaluations)) if evaluations else 0,
+            "unique_topics": len(set(e.get("topic", "") for e in evaluations)) if evaluations else 0
+        }
+        print(f"[DEBUG] get_evaluations_summary: {summary}")
+        return summary
+    except Exception as e:
+        print(f"[ERROR] get_evaluations_summary failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"total": 0, "avg_score": 0, "unique_students": 0, "unique_topics": 0}
 
 
 # ===============================

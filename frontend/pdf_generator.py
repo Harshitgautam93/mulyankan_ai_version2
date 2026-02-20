@@ -43,7 +43,8 @@ class PDFReport(FPDF):
     def subsection_header(self, title):
         self.set_font('Arial', 'B', 10)
         self.set_text_color(50, 50, 50)
-        self.multi_cell(0, 6, f"• {title}", align='L')
+        # Use ASCII "*" instead of Unicode bullet "•"
+        self.multi_cell(0, 6, f"* {title}", align='L')
         self.ln(0.3)
 
 def generate_pdf_bytes(question, student_ans, evaluation_dict, roll_number=None):
@@ -53,17 +54,36 @@ def generate_pdf_bytes(question, student_ans, evaluation_dict, roll_number=None)
     eff_width = pdf.w - 2 * pdf.l_margin
 
     def sanitize_text(text, max_length=None):
+        """Convert text to PDF-safe format (latin-1 compatible)"""
         text = str(text) if text else ""
-        chars = {
-            '\u2013': '-', '\u2014': '-', '\u2019': "'", 
-            '\u201d': '"', '\u201c': '"', '\u2717': 'x', 
-            '\u2713': 'v', '\u2022': '*'
+        
+        # Unicode to ASCII character mappings
+        char_map = {
+            # Dashes and hyphens
+            '\u2013': '-', '\u2014': '-', '\u2010': '-', '\u2011': '-',
+            # Quotes
+            '\u2019': "'", '\u2018': "'", 
+            '\u201d': '"', '\u201c': '"',
+            # Bullets and symbols
+            '\u2022': '*', '\u2717': 'x', '\u2713': 'v',
+            '\u2192': '->', '\u2190': '<-', '\u2191': '^', '\u2193': 'v',
+            '\u2640': 'F', '\u2642': 'M',
+            '\u00a9': '(c)', '\u00ae': '(R)', '\u2122': '(TM)',
+            '\u2026': '...', '\u00b7': '*',
+            # Math and arrows
+            '\u00f7': '/', '\u00d7': 'x',
+            '\u2261': '=',
         }
-        for k, v in chars.items():
-            text = text.replace(k, v)
+        
+        for unicode_char, ascii_char in char_map.items():
+            text = text.replace(unicode_char, ascii_char)
+        
+        # Remove any remaining non-latin1 characters
         text = text.encode('latin-1', 'ignore').decode('latin-1')
+        
         if max_length and len(text) > max_length:
             text = text[:max_length] + "..."
+        
         return text
     
     try:

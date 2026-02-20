@@ -14,6 +14,9 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
+# Load environment variables from root .env file
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
+
 # PDF parsing dependency
 try:
     import PyPDF2
@@ -21,7 +24,15 @@ try:
 except Exception:
     _HAS_PYPDF2 = False
 
-load_dotenv()
+# Analytics & Visualization
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    _HAS_PLOTLY = True
+except Exception:
+    _HAS_PLOTLY = False
+
+from datetime import datetime
 
 # ===============================
 # 1. Professional Page Config
@@ -236,16 +247,38 @@ st.markdown("""
 BACKEND_OK = True
 try:
     from backend.main import process_assignment_evaluation
-    from backend.database import (
-        store_guideline, save_evaluation_result,
-        get_all_evaluations, get_average_score, get_grade_distribution,
-        get_topic_performance, get_student_performance, get_evaluations_by_topic,
-        get_evaluations_over_time, get_top_students, get_evaluations_summary,
-        get_score_distribution, get_topic_evaluation_count, get_student_evaluation_count,
-        get_weak_students, get_strong_students, get_class_stats, get_performance_by_grade,
-        get_topic_difficulty, get_assignments_per_student, get_recent_evaluations,
-        get_evaluation_stats_by_date, insert_test_data
-    )
+    # Import database module directly to avoid name-binding races in Streamlit
+    import backend.database as db_service
+    
+    # Map functions for easier access
+    get_all_evaluations = db_service.get_all_evaluations
+    get_average_score = db_service.get_average_score
+    get_grade_distribution = db_service.get_grade_distribution
+    get_topic_performance = db_service.get_topic_performance
+    get_student_performance = db_service.get_student_performance
+    get_evaluations_by_topic = db_service.get_evaluations_by_topic
+    get_evaluations_over_time = db_service.get_evaluations_over_time
+    get_top_students = db_service.get_top_students
+    get_evaluations_summary = db_service.get_evaluations_summary
+    get_score_distribution = db_service.get_score_distribution
+    get_topic_evaluation_count = db_service.get_topic_evaluation_count
+    get_student_evaluation_count = db_service.get_student_evaluation_count
+    get_weak_students = db_service.get_weak_students
+    get_strong_students = db_service.get_strong_students
+    get_class_stats = db_service.get_class_stats
+    get_performance_by_grade = db_service.get_performance_by_grade
+    get_topic_difficulty = db_service.get_topic_difficulty
+    get_assignments_per_student = db_service.get_assignments_per_student
+    get_recent_evaluations = db_service.get_recent_evaluations
+    get_evaluation_stats_by_date = db_service.get_evaluation_stats_by_date
+    insert_test_data = db_service.insert_test_data
+    save_evaluation_result = db_service.save_evaluation_result
+    store_guideline = db_service.store_guideline
+    
+    # Optional Data Management functions (handled gracefully)
+    delete_all_evaluations = getattr(db_service, 'delete_all_evaluations', None)
+    delete_mock_data = getattr(db_service, 'delete_mock_data', None)
+
     from frontend.pdf_generator import generate_pdf_bytes
     # Optional backend helpers
     try:
@@ -257,6 +290,17 @@ try:
 except ImportError as e:
     BACKEND_OK = False
     st.error(f"Import Error: {e}. Ensure '__init__.py' exists.")
+
+# ===============================
+# 4. Analytics Data Fetching (Direct)
+# ===============================
+def cached_get_summary():
+    # Caching removed for automatic reloading
+    return get_evaluations_summary()
+
+@st.cache_data(ttl=600)
+def cached_get_all_evaluations():
+    return get_all_evaluations()
 
 # ===============================
 # 3. Hardcoded Authentication
@@ -394,6 +438,10 @@ if is_authenticated and username:
                             )
                         
                         if eval_result:
+                            # Debug: Check if result contains expected fields
+                            if not eval_result.get('score') and not eval_result.get('feedback'):
+                                st.warning(f"⚠️ Backend returned incomplete data. Response: {eval_result}")
+                            
                             # Store evaluation result in session state to persist across reruns
                             st.session_state.last_evaluation_result = eval_result
                             st.session_state.last_evaluation_points = points_possible
@@ -401,32 +449,141 @@ if is_authenticated and username:
                             st.session_state.last_evaluation_topic = input_q
                             st.session_state.evaluation_completed = True
                             st.balloons()
+                            st.rerun()
+                        else:
+                            st.error("❌ Evaluation returned no result.")
                     except Exception as e:
                         st.error(f"❌ Evaluation Error: {e}")
+                        import traceback
+                        st.code(traceback.format_exc(), language="python")
             else:
                 st.warning("⚠️ Please fill in Student Name, Roll Number, Topic, and Upload a PDF.")
         
         # Display evaluation results if they exist (persistent across page interactions)
         if st.session_state.last_evaluation_result:
             st.divider()
-            st.markdown("<h3>✅ Evaluation Complete</h3>", unsafe_allow_html=True)
-            res_col1, res_col2, res_col3 = st.columns(3)
             eval_result = st.session_state.last_evaluation_result
-            res_col1.metric("Score", f"{eval_result.get('score')}/{st.session_state.last_evaluation_points}")
-            res_col2.metric("Grade", eval_result.get('grade'))
-            res_col3.metric("Roll No.", st.session_state.last_evaluation_roll or "N/A")
-            st.info(f"**Feedback:** {eval_result.get('feedback')}")
             
-            # PDF Download with roll number
-            out_pdf = generate_pdf_bytes(st.session_state.last_evaluation_topic or "Assignment", "[From PDF]", eval_result, roll_number=st.session_state.last_evaluation_roll)
-            filename = f"{st.session_state.last_evaluation_roll}_{st.session_state.username}_Report.pdf" if st.session_state.last_evaluation_roll else f"{st.session_state.username}_Report.pdf"
-            st.download_button("📥 Download Report", out_pdf, filename, use_container_width=True, key="download_report")
+            # Check for errors in the result
+            if eval_result.get('feedback') and 'Evaluation error' in eval_result.get('feedback', ''):
+                st.error(f"❌ {eval_result.get('feedback')}")
+            else:
+                st.markdown("<h3>✅ Evaluation Complete</h3>", unsafe_allow_html=True)
+                
+                # Quick metrics
+                res_col1, res_col2, res_col3 = st.columns(3)
+                res_col1.metric("Score", f"{eval_result.get('score', 'N/A')}/{st.session_state.last_evaluation_points}")
+                res_col2.metric("Grade", eval_result.get('grade', 'N/A'))
+                res_col3.metric("Roll No.", st.session_state.last_evaluation_roll or "N/A")
+                
+                # Main feedback
+                st.subheader("📋 Feedback")
+                st.info(eval_result.get('feedback', 'No feedback available'))
+                
+                # Topic Diagnostic (if applicable)
+                if eval_result.get('topic_diagnostic'):
+                    st.subheader("⚠️ Topic Assessment")
+                    st.warning(eval_result.get('topic_diagnostic'))
+                
+                # Rubric Breakdown
+                if eval_result.get('rubric_breakdown') and len(eval_result['rubric_breakdown']) > 0:
+                    st.subheader("📊 Rubric Breakdown")
+                    for item in eval_result['rubric_breakdown']:
+                        if isinstance(item, dict):
+                            col1, col2 = st.columns([3, 1])
+                            criteria = item.get('criteria', 'N/A')
+                            score = item.get('score', 'N/A')
+                            max_score = item.get('max_score', '10')
+                            feedback = item.get('feedback', '')
+                            
+                            with col1:
+                                st.write(f"**{criteria}**")
+                                st.caption(feedback)
+                            with col2:
+                                st.metric("", f"{score}/{max_score}")
+                
+                # Missing Concepts
+                if eval_result.get('missing_concepts') and len(eval_result['missing_concepts']) > 0:
+                    st.subheader("🔍 Missing Concepts")
+                    for concept in eval_result['missing_concepts']:
+                        if isinstance(concept, dict):
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.write(f"**{concept.get('concept', 'N/A')}**")
+                                st.caption(concept.get('explanation', ''))
+                            with col2:
+                                importance = concept.get('importance', 'MEDIUM')
+                                if importance == 'HIGH':
+                                    st.error(importance)
+                                elif importance == 'MEDIUM':
+                                    st.warning(importance)
+                                else:
+                                    st.info(importance)
+                
+                # Bridge Guidance
+                if eval_result.get('bridge_guidance'):
+                    st.subheader("🌉 How to Improve")
+                    st.write(eval_result['bridge_guidance'])
+                
+                # Suggested Resources
+                if eval_result.get('suggested_resources') and len(eval_result['suggested_resources']) > 0:
+                    st.subheader("📚 Suggested Resources")
+                    for resource in eval_result['suggested_resources']:
+                        if isinstance(resource, dict):
+                            with st.expander(f"{resource.get('title', 'Resource')}"):
+                                st.write(f"**Learn:** {resource.get('description', '')}")
+                                st.write(f"**Action:** {resource.get('action_item', '')}")
+                
+                # Metadata
+                if eval_result.get('metadata'):
+                    with st.expander("📌 Evaluation Metadata"):
+                        meta = eval_result['metadata']
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Complexity", meta.get('complexity_level', 'N/A'))
+                        with col2:
+                            st.metric("AI Confidence", f"{meta.get('ai_confidence', '0')}%")
+                        with col3:
+                            st.metric("Plagiarism Check", f"{meta.get('plagiarism_similarity', '0')}%")
+                
+                # PDF Download with roll number
+                st.divider()
+                st.subheader("💾 Download Report")
+                try:
+                    out_pdf = generate_pdf_bytes(st.session_state.last_evaluation_topic or "Assignment", "[From PDF]", eval_result, roll_number=st.session_state.last_evaluation_roll)
+                    filename = f"{st.session_state.last_evaluation_roll}_{st.session_state.username}_Report.pdf" if st.session_state.last_evaluation_roll else f"{st.session_state.username}_Report.pdf"
+                    st.download_button("📥 Download Full Report (PDF)", out_pdf, filename, use_container_width=True, key="download_report")
+                except Exception as e:
+                    st.error(f"❌ Could not generate PDF: {e}")
+                    import traceback
+                    st.code(traceback.format_exc(), language="python")
             
             # Clear button to reset and evaluate another assignment
             if st.button("➕ Evaluate Another", use_container_width=True, key="eval_another"):
                 st.session_state.last_evaluation_result = None
                 st.session_state.evaluation_completed = False
                 st.rerun()
+        
+        # --- NEW: PERSISTENT HISTORY VIEW ---
+        st.markdown("---")
+        with st.expander("📜 Your Evaluation History", expanded=False):
+            all_evals = get_all_evaluations()
+            if all_evals:
+                # Filter for non-mock data if possible, or just show all
+                history_data = []
+                for e in all_evals[:20]:
+                    history_data.append({
+                        "Time": e.get("created_at", "")[11:16] if e.get("created_at") else "N/A",
+                        "Roll": e.get("student_roll", "N/A"),
+                        "Student": e.get("student_name", "N/A"),
+                        "Topic": e.get("topic", "N/A"),
+                        "Score": e.get("score", "N/A"),
+                        "Grade": e.get("grade", "N/A")
+                    })
+                st.table(pd.DataFrame(history_data))
+                st.caption("Check the 'Analytics' tab for full ranking and statistics.")
+            else:
+                st.info("No evaluations in history yet.")
 
     with tab2:
         st.markdown("<h2>🧬 Knowledge Ingestion</h2>", unsafe_allow_html=True)
@@ -450,165 +607,373 @@ if is_authenticated and username:
             
             if submitted_ref and uploaded_guideline:
                 pdf_bytes = uploaded_guideline.read()
-                # Existing logic for storing guidelines...
-                st.success("✅ Guideline successfully ingested into Vector DB.")
+                with st.spinner("📌 Processing and storing guideline..."):
+                    try:
+                        if _store_guideline_from_pdf:
+                            result = _store_guideline_from_pdf(pdf_bytes)
+                            st.success(f"✅ {result}")
+                        else:
+                            st.error("❌ Knowledge ingestion service not available. Check backend imports.")
+                    except Exception as e:
+                        st.error(f"❌ Error storing guideline: {e}")
+                        import traceback
+                        st.code(traceback.format_exc(), language="python")
         
         st.markdown("</div>", unsafe_allow_html=True)
 
     with tab3:
-        st.markdown("<h2>📈 Comprehensive Analytics Dashboard</h2>", unsafe_allow_html=True)
-        
-        # Add refresh button and timestamp
-        from datetime import datetime
-        refresh_col1, refresh_col2, refresh_col3 = st.columns([6, 2, 2])
-        
-        with refresh_col2:
-            if st.button("🔄 Refresh Data", use_container_width=True, help="Click to refresh analytics with latest data"):
-                st.rerun()
-        
-        with refresh_col3:
-            st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+        st.markdown("<h2>📈 Performance Analytics</h2>", unsafe_allow_html=True)
+        st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
         
         if not BACKEND_OK:
-            st.warning("⚠️ Analytics is unavailable because backend imports failed. Fix the import error above to enable analytics.")
+            st.warning("⚠️ Analytics is unavailable because backend imports failed.")
         else:
             try:
                 summary = get_evaluations_summary()
+                all_evals_for_tab3 = get_all_evaluations()
             except Exception as e:
                 st.error(f"❌ Error loading analytics: {e}")
                 summary = {"total": 0}
+                all_evals_for_tab3 = []
             
-            if summary["total"] == 0:
-                st.info("📊 No data yet. Start evaluating in Tab 1 to see analytics.")
+            if not all_evals_for_tab3:
+                st.info("📊 No student evaluations found yet. Go to 'Student Evaluation' to process your first submission.")
             else:
                 # ===== TOP SUMMARY METRICS =====
                 class_stats = get_class_stats()
                 col1, col2, col3, col4, col5, col6 = st.columns(6)
-                col1.metric("Total", summary["total"])
-                col2.metric("Avg", f"{summary['avg_score']}/10")
-                col3.metric("Students", summary["unique_students"])
-                col4.metric("Topics", summary["unique_topics"])
+                col1.metric("📊 Total", summary["total"])
+                col2.metric("⭐ Avg", f"{summary['avg_score']}/10")
+                col3.metric("👥 Students", summary["unique_students"])
+                col4.metric("📚 Topics", summary["unique_topics"])
                 if class_stats:
-                    col5.metric("Median", f"{class_stats['median']}/10")
-                    col6.metric("Std Dev", f"{class_stats['std_dev']}")
+                    col5.metric("📈 Median", f"{class_stats['median']}/10")
+                    col6.metric("📉 Std Dev", f"{class_stats['std_dev']}")
                 
-                # ===== VISUALIZATIONS ROW 1 =====
-                st.markdown("**📉 Distributions**")
-                viz_col1, viz_col2 = st.columns(2)
+                st.divider()
                 
-                with viz_col1:
+                # ===== VISUALIZATION ROW 1: SCORE AND GRADE DISTRIBUTIONS =====
+                st.markdown("### 📊 Performance Overview")
+                dist_col1, dist_col2 = st.columns(2)
+                
+                with dist_col1:
                     score_dist = get_score_distribution()
-                    score_dist_clean = {k: v for k, v in score_dist.items() if v > 0}
-                    if score_dist_clean:
-                        st.bar_chart(score_dist_clean, height=200)
+                    score_labels = list(score_dist.keys())
+                    score_values = list(score_dist.values())
+                    
+                    fig_score = go.Figure(data=[
+                        go.Pie(
+                            labels=score_labels,
+                            values=score_values,
+                            hole=0,
+                            marker=dict(colors=['#d32f2f', '#f57c00', '#fac858', '#97be32', '#34c368'])
+                        )
+                    ])
+                    fig_score.update_layout(
+                        title="Score Distribution",
+                        height=300,
+                        showlegend=True,
+                        margin=dict(l=0, r=0, t=30, b=0)
+                    )
+                    st.plotly_chart(fig_score, use_container_width=True)
                 
-                with viz_col2:
+                with dist_col2:
                     grade_dist = get_grade_distribution()
-                    grade_dist_clean = {k: v for k, v in grade_dist.items() if v > 0}
-                    if grade_dist_clean:
-                        st.bar_chart(grade_dist_clean, height=200)
+                    grade_labels = [k for k, v in grade_dist.items() if v > 0]
+                    grade_values = [v for k, v in grade_dist.items() if v > 0]
+                    grade_colors = {'A': '#34c368', 'B': '#97be32', 'C': '#fac858', 'D': '#f57c00', 'F': '#d32f2f'}
+                    grade_color_list = [grade_colors.get(g, '#808080') for g in grade_labels]
+                    
+                    fig_grade = go.Figure(data=[
+                        go.Bar(
+                            x=grade_labels,
+                            y=grade_values,
+                            marker=dict(color=grade_color_list),
+                            text=grade_values,
+                            textposition='auto',
+                        )
+                    ])
+                    fig_grade.update_layout(
+                        title="Grade Distribution",
+                        xaxis_title="Grade",
+                        yaxis_title="Count",
+                        height=300,
+                        showlegend=False,
+                        margin=dict(l=40, r=20, t=30, b=40)
+                    )
+                    st.plotly_chart(fig_grade, use_container_width=True)
                 
-                # ===== VISUALIZATIONS ROW 2 =====
-                st.markdown("**📚 Topics**")
+                st.divider()
+                
+                # ===== VISUALIZATION ROW 2: TOPICS =====
+                st.markdown("### 📚 Topic Performance")
                 topic_col1, topic_col2 = st.columns(2)
                 
                 with topic_col1:
                     topic_eval_count = get_evaluations_by_topic()
                     if topic_eval_count:
-                        st.bar_chart(topic_eval_count, height=200)
+                        topics = list(topic_eval_count.keys())
+                        counts = list(topic_eval_count.values())
+                        
+                        fig_topic_count = go.Figure(data=[
+                            go.Bar(
+                                x=topics,
+                                y=counts,
+                                marker=dict(color=counts, colorscale='Blues', showscale=False),
+                                text=counts,
+                                textposition='auto',
+                            )
+                        ])
+                        fig_topic_count.update_layout(
+                            title="Evaluations per Topic",
+                            xaxis_title="Topic",
+                            yaxis_title="Count",
+                            height=300,
+                            showlegend=False,
+                            margin=dict(l=40, r=20, t=30, b=80),
+                            xaxis_tickangle=-45
+                        )
+                        st.plotly_chart(fig_topic_count, use_container_width=True)
                 
                 with topic_col2:
                     topic_perf = get_topic_performance()
                     if topic_perf:
-                        st.bar_chart(topic_perf, height=200)
+                        topics = list(topic_perf.keys())
+                        scores = list(topic_perf.values())
+                        
+                        fig_topic_perf = go.Figure(data=[
+                            go.Bar(
+                                x=topics,
+                                y=scores,
+                                marker=dict(
+                                    color=scores,
+                                    colorscale=['#d32f2f', '#f57c00', '#fac858', '#97be32', '#34c368'],
+                                    cmin=0,
+                                    cmax=10
+                                ),
+                                text=[f"{s:.1f}" for s in scores],
+                                textposition='auto',
+                            )
+                        ])
+                        fig_topic_perf.update_layout(
+                            title="Average Score by Topic",
+                            xaxis_title="Topic",
+                            yaxis_title="Average Score",
+                            height=300,
+                            showlegend=False,
+                            yaxis=dict(range=[0, 10]),
+                            margin=dict(l=40, r=20, t=30, b=80),
+                            xaxis_tickangle=-45
+                        )
+                        st.plotly_chart(fig_topic_perf, use_container_width=True)
                 
-                # ===== STUDENT ANALYSIS =====
-                st.markdown("**👥 Students**")
+                st.divider()
+                
+                # ===== VISUALIZATION ROW 3: STUDENT ANALYSIS =====
+                st.markdown("### 👥 Student Performance")
                 student_col1, student_col2 = st.columns(2)
                 
                 with student_col1:
                     top_students = get_top_students(10)
                     if top_students:
-                        st.bar_chart(top_students, height=200)
+                        students = list(top_students.keys())
+                        scores = list(top_students.values())
+                        
+                        fig_top_students = go.Figure(data=[
+                            go.Bar(
+                                y=students,
+                                x=scores,
+                                orientation='h',
+                                marker=dict(
+                                    color=scores,
+                                    colorscale='Viridis',
+                                    showscale=True,
+                                    colorbar=dict(title="Score")
+                                ),
+                                text=[f"{s:.1f}" for s in scores],
+                                textposition='auto',
+                            )
+                        ])
+                        fig_top_students.update_layout(
+                            title="Top 10 Students",
+                            xaxis_title="Average Score",
+                            height=300,
+                            showlegend=False,
+                            xaxis=dict(range=[0, 10]),
+                            margin=dict(l=150, r=20, t=30, b=40)
+                        )
+                        st.plotly_chart(fig_top_students, use_container_width=True)
                 
                 with student_col2:
                     student_eval_freq = get_student_evaluation_count()
-                    top_10_freq = dict(list(student_eval_freq.items())[:10])
-                    if top_10_freq:
-                        st.bar_chart(top_10_freq, height=200)
+                    if student_eval_freq:
+                        top_10_students = dict(list(student_eval_freq.items())[:10])
+                        students = list(top_10_students.keys())
+                        freq = list(top_10_students.values())
+                        
+                        fig_eval_freq = go.Figure(data=[
+                            go.Bar(
+                                y=students,
+                                x=freq,
+                                orientation='h',
+                                marker=dict(color='#4e89ae'),
+                                text=freq,
+                                textposition='auto',
+                            )
+                        ])
+                        fig_eval_freq.update_layout(
+                            title="Top 10 Students by Evaluation Count",
+                            xaxis_title="Number of Evaluations",
+                            height=300,
+                            showlegend=False,
+                            margin=dict(l=150, r=20, t=30, b=40)
+                        )
+                        st.plotly_chart(fig_eval_freq, use_container_width=True)
+                
+                st.divider()
                 
                 # ===== STUDENT SEGMENTATION =====
-                st.markdown("**🎯 Segmentation**")
+                st.markdown("### 🎯 Student Segmentation")
                 seg_col1, seg_col2 = st.columns(2)
                 
                 with seg_col1:
-                    st.markdown("**Top Performers (≥7)**")
+                    st.markdown("**🏆 Top Performers (≥7)**")
                     strong_students = get_strong_students(7)
                     if strong_students:
-                        strong_df = pd.DataFrame(list(strong_students.items()), columns=["Student", "Score"])
-                        st.dataframe(strong_df, use_container_width=True, hide_index=True, height=200)
+                        strong_data = [{"Student": s, "Score": score} for s, score in strong_students.items()]
+                        strong_df = pd.DataFrame(strong_data).head(10)
+                        st.dataframe(strong_df, use_container_width=True, hide_index=True, height=250)
+                    else:
+                        st.info("No top performers yet")
                 
                 with seg_col2:
-                    st.markdown("**Needs Support (<5)**")
+                    st.markdown("**⚠️ Needs Support (<5)**")
                     weak_students = get_weak_students(5)
                     if weak_students:
-                        weak_df = pd.DataFrame(list(weak_students.items()), columns=["Student", "Score"])
-                        st.dataframe(weak_df, use_container_width=True, hide_index=True, height=200)
+                        weak_data = [{"Student": s, "Score": score} for s, score in weak_students.items()]
+                        weak_df = pd.DataFrame(weak_data).head(10)
+                        st.dataframe(weak_df, use_container_width=True, hide_index=True, height=250)
+                    else:
+                        st.info("No students need support")
+                
+                st.divider()
                 
                 # ===== TREND ANALYSIS =====
-                st.markdown("**📈 Trends**")
+                st.markdown("### 📈 Evaluation Trends")
                 date_stats = get_evaluation_stats_by_date()
                 if date_stats:
-                    date_counts = {date: data["count"] for date, data in date_stats.items()}
-                    st.line_chart(date_counts, height=250)
+                    dates = list(date_stats.keys())
+                    counts = [date_stats[d]["count"] for d in dates]
+                    avg_scores = [date_stats[d]["avg_score"] for d in dates]
+                    
+                    fig_trends = go.Figure()
+                    fig_trends.add_trace(go.Scatter(
+                        x=dates, y=counts,
+                        mode='lines+markers',
+                        name='Evaluation Count',
+                        yaxis='y1',
+                        line=dict(color='#4e89ae', width=2),
+                        marker=dict(size=8)
+                    ))
+                    fig_trends.add_trace(go.Scatter(
+                        x=dates, y=avg_scores,
+                        mode='lines+markers',
+                        name='Avg Score',
+                        yaxis='y2',
+                        line=dict(color='#fac858', width=2),
+                        marker=dict(size=8)
+                    ))
+                    fig_trends.update_layout(
+                        title="Evaluation Trends Over Time",
+                        xaxis_title="Date",
+                        yaxis=dict(
+                            title=dict(text="Evaluation Count", font=dict(color='#4e89ae')),
+                            tickfont=dict(color='#4e89ae')
+                        ),
+                        yaxis2=dict(
+                            title=dict(text="Average Score", font=dict(color='#fac858')),
+                            tickfont=dict(color='#fac858'),
+                            overlaying='y',
+                            side='right',
+                            range=[0, 10]
+                        ),
+                        height=350,
+                        hovermode='x unified',
+                        margin=dict(l=60, r=60, t=40, b=60),
+                        legend=dict(x=0.01, y=0.99)
+                    )
+                    st.plotly_chart(fig_trends, use_container_width=True)
+                
+                st.divider()
                 
                 # ===== DETAILED TABLES =====
-                with st.expander("📋 Details (Expand)", expanded=False):
-                    col_tbl1, col_tbl2 = st.columns(2)
+                with st.expander("📋 Detailed Analysis (Expand)", expanded=False):
+                    detail_col1, detail_col2 = st.columns(2)
                     
-                    with col_tbl1:
+                    with detail_col1:
                         st.markdown("**Performance by Grade**")
                         perf_by_grade = get_performance_by_grade()
                         if perf_by_grade:
-                            grade_df = pd.DataFrame([
-                                {
+                            grade_data = []
+                            for grade, data in sorted(perf_by_grade.items(), key=lambda x: {'A': 0, 'B': 1, 'C': 2, 'D': 3, 'F': 4}.get(x[0], 5)):
+                                grade_data.append({
                                     "Grade": grade,
                                     "Count": data["count"],
-                                    "Avg": data["avg_score"]
-                                }
-                                for grade, data in perf_by_grade.items()
-                            ])
-                            st.dataframe(grade_df, use_container_width=True, hide_index=True, height=250)
+                                    "Avg Score": f"{data['avg_score']:.2f}"
+                                })
+                            grade_df = pd.DataFrame(grade_data)
+                            st.dataframe(grade_df, use_container_width=True, hide_index=True)
                     
-                    with col_tbl2:
-                        st.markdown("**Topic Difficulty**")
+                    with detail_col2:
+                        st.markdown("**Topic Difficulty Ranking**")
                         topic_diff = get_topic_difficulty()
                         if topic_diff:
-                            difficulty_df = pd.DataFrame([
-                                {
+                            difficulty_data = []
+                            for i, (topic, score) in enumerate(topic_diff.items(), 1):
+                                if score >= 7:
+                                    level = "🟢 Easy"
+                                elif score >= 5:
+                                    level = "🟡 Medium"
+                                else:
+                                    level = "🔴 Hard"
+                                difficulty_data.append({
+                                    "Rank": i,
                                     "Topic": topic,
-                                    "Avg": score,
-                                    "Level": "🟢 Easy" if score >= 7 else "🟡 Med" if score >= 5 else "🔴 Hard"
-                                }
-                                for topic, score in topic_diff.items()
-                            ])
-                            st.dataframe(difficulty_df, use_container_width=True, hide_index=True, height=250)
+                                    "Avg Score": f"{score:.2f}",
+                                    "Level": level
+                                })
+                            diff_df = pd.DataFrame(difficulty_data)
+                            st.dataframe(diff_df, use_container_width=True, hide_index=True)
                     
-                    st.markdown("**Recent Evaluations**")
+                    st.markdown("**Leaderboard: Top Ranked Students (Top Score)**")
                     all_evals = get_all_evaluations()
                     if all_evals:
-                        df_evals = pd.DataFrame([
-                            {
-                                "Roll No.": e.get("student_roll", "N/A"),
-                                "Student": e.get("student_name", "N/A"),
-                                "Topic": e.get("topic", "N/A"),
-                                "Score": e.get("score", "N/A"),
+                        eval_data = []
+                        # Convert scores to float for proper sorting
+                        for record in all_evals:
+                            record['_score_numeric'] = 0.0
+                            try:
+                                record['_score_numeric'] = float(record.get('score', 0))
+                            except: pass
+                        
+                        # Sort by score descending (Highest score @ #1)
+                        sorted_evals = sorted(all_evals, key=lambda x: x['_score_numeric'], reverse=True)
+                        
+                        for e in sorted_evals[:100]:
+                            feedback_text = str(e.get("feedback", "N/A"))[:60]
+                            if len(str(e.get("feedback", ""))) > 60:
+                                feedback_text += "..."
+                            eval_data.append({
+                                "Rank": sorted_evals.index(e) + 1,
+                                "Roll": e.get("student_roll", "N/A"),
+                                "Student": e.get("student_name", "N/A")[:25],
+                                "Score": f"{e.get('score', '0')}/10",
                                 "Grade": e.get("grade", "N/A"),
-                                "Feedback": str(e.get("feedback", "N/A"))[:50] + "..." if len(str(e.get("feedback", ""))) > 50 else str(e.get("feedback", "N/A"))
-                            }
-                            for e in all_evals[:15]
-                        ])
-                        st.dataframe(df_evals, use_container_width=True, height=300)
+                                "Topic": e.get("topic", "N/A")[:20],
+                                "Date": e.get("created_at", "N/A")[:10] if e.get("created_at") else "N/A",
+                            })
+                        df_evals = pd.DataFrame(eval_data)
+                        st.dataframe(df_evals, use_container_width=True, height=500, hide_index=True)
 else:
     # --- LOGGED OUT AREA (Login Form) ---
     st.markdown("---")

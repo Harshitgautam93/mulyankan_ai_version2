@@ -1,14 +1,55 @@
 import os
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from typing import List, Dict
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
+# Load environment variables from root .env file BEFORE processing
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+env_path = os.path.join(project_root, ".env")
+print(f"\n{'='*60}")
+print(f"[MAIN.PY INIT] Loading environment variables")
+print(f"{'='*60}")
+print(f"Project root: {project_root}")
+print(f"Env file path: {env_path}")
+print(f"Env file exists: {os.path.exists(env_path)}")
+
+# Load env file with override to ensure fresh load
+load_dotenv(env_path, override=True)
+
+# IMPORTANT: Store API key as module-level variable so it persists
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+
+# Verify all environment variables are loaded
+print(f"\n[MAIN.PY INIT] Checking loaded environment variables:")
+for key in ["GROQ_API_KEY", "GROQ_MODEL", "SUPABASE_URL", "SUPABASE_KEY"]:
+    value = os.getenv(key)
+    if value:
+        if len(value) > 20:
+            print(f"  LOADED {key}: {value[:20]}...({len(value)} chars)")
+        else:
+            print(f"  LOADED {key}: {value}")
+    else:
+        print(f"  MISSING {key}")
+
+if not GROQ_API_KEY:
+    print(f"\n[WARNING] GROQ_API_KEY is not set!")
+    print(f"[WARNING] Checking if it exists in environment after explicit load:")
+    print(f"  Value: {os.getenv('GROQ_API_KEY')}")
+else:
+    print(f"\n[SUCCESS] GROQ_API_KEY successfully loaded: {GROQ_API_KEY[:20]}...")
+
+print(f"{'='*60}\n")
+
 # Import your custom database and PDF utilities
 from backend.database import retrieve_relevant_guideline, save_evaluation_result
 from backend.database import store_guideline as _store_guideline
-from backend.pdf_utils import extract_text_from_pdf_bytes, extract_and_parse_pdf
+from backend.pdf_utils import extract_text_from_pdf_bytes, extract_and_parse_pdf, _HAS_PYTESSERACT
+
+print(f"[MAIN.PY] OCR Enabled: {_HAS_PYTESSERACT}")
 
 # --- SCHEMA DEFINITIONS ---
 class RubricCriterion(BaseModel):
@@ -48,103 +89,117 @@ def process_assignment_evaluation(question, student_answer, rubric, student_name
     """
     Core evaluation function - orchestrates LLM grading with detailed feedback
     """
-    llm = ChatGroq(
-        model=os.getenv("GROQ_MODEL", "mixtral-8x7b-32768"),
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0
-    )
-    parser = JsonOutputParser(pydantic_object=EvaluationSchema)
-    
-    sample_solution = retrieve_relevant_guideline(question) or "Use the rubric as reference."
-
-    prompt = ChatPromptTemplate.from_template("""
-    You are an expert AI grader providing comprehensive, pedagogically-sound feedback.
-    
-    Your task: Evaluate the student's answer and provide not just a grade, but actionable insights for improvement.
-    
-    CONTEXT:
-    --------
-    Question: {question}
-    Sample Solution/Guideline: {sample_solution}
-    Student Answer: {student_answer}
-    Grading Rubric: {rubric}
-    
-    EVALUATION INSTRUCTIONS:
-    -----------------------
-    
-    1. EXECUTIVE SUMMARY (score, grade, feedback):
-       - Assign a score (0-10) and corresponding letter grade (A=9-10, B=7-8, C=5-6, D=3-4, F=0-2)
-       - Provide a concise executive summary of the answer's strengths and overall assessment
-    
-    2. TOPIC SWAP DIAGNOSTIC (if applicable):
-       - If the score is 3 or lower, check if the student answered the WRONG question
-       - Use language like: "Your submission accurately describes X and Y. However, the assignment specifically asked for Z. While these are both [domain] concepts, they serve different purposes."
-       - This helps students understand they didn't fail at the technique—they misunderstood the assignment
-       - Leave blank/empty if the score is above 3 or the answer is on-topic
-    
-    3. RUBRIC BREAKDOWN:
-       - Break down the evaluation into specific criteria from the rubric
-       - For each criterion, assign individual scores with specific feedback
-       - Format: criteria name, score/max_score, and targeted feedback for improvement
-       - Be specific: explain WHAT was done well or WHAT was missing
-       - Show both strengths AND gaps (e.g., "Constructors were well-defined, BUT you missed Polymorphism")
-    
-    4. GAP ANALYSIS (What was Missing):
-       - Identify key concepts, facts, or techniques that should have been included
-       - For each missing element:
-         * List the concept name
-         * Rate its importance (HIGH/MEDIUM/LOW)
-         * Explain why it was important for this answer (e.g., "Method Overriding: Necessary for creating flexible, interchangeable code")
-       - This helps students understand the "expected vs actual" gap
-    
-    5. THE BRIDGE (Corrective Guidance):
-       - Compare what the student wrote to what the correct answer should contain
-       - Show the relationship between their effort and the expected answer
-       - Use language like: "It seems you focused on X. However, Y is what the question asked for."
-       - Help them see their work wasn't wasted—just misdirected
-       - Provide the conceptual link between what they did right and what to do next time
-       - Example: "To improve, try rewriting your code so that different classes (like 'Cat' and 'Dog') can both use a 'speak()' method, but produce different results."
-    
-    6. SUGGESTED RESOURCES & NEXT STEPS:
-       - Provide 2-3 actionable learning resources
-       - For each resource:
-         * Title of the reading/concept
-         * What the student should learn from it (in the context of their mistake)
-         * Specific action to take (e.g., "Review method overriding in Python documentation")
-    
-    7. METADATA FOR TRACKING:
-       - Complexity Level: What level is this problem? (Beginner/Intermediate/Advanced)
-       - AI Confidence: How confident are you in this grading? (0-100%)
-       - Plagiarism Similarity: Estimate % similarity to standard solutions (0-100%)
-    
-    {format_instructions}
-    """)
-
-    chain = prompt | llm | parser
-
     try:
-        result = chain.invoke({
+        # 1. Retrieve the reference guideline from Database
+        reference_guideline = retrieve_relevant_guideline(question)
+        print(f"[PROCESS_EVAL] Guideline found for '{question}': {reference_guideline is not None}")
+
+        # 2. System Instructions for Grading
+        template = """
+        You are an expert academic evaluator. Your task is to evaluate a student's answer based on a specific question, a set of rubric criteria, and a reference guideline.
+
+        QUESTION/TOPIC: {question}
+
+        REFERENCE GUIDELINE (Use this as the standard for accuracy):
+        {reference_guideline}
+
+        RUBRIC CRITERIA:
+        {rubric}
+
+        STUDENT ANSWER TO EVALUATE:
+        {student_answer}
+
+        Instructions:
+        1. Compare the student answer against the reference guideline.
+        2. Strictly follow the provided rubric criteria for scoring.
+        3. Provide a score from 0 to 10 (as a string).
+        4. Assign a letter grade (A, B, C, D, or F).
+        5. If the student's answer is completely off-topic or addresses the wrong question, provide a diagnostic note in 'topic_diagnostic' and give a low score.
+        6. Identify specific missing concepts or inaccuracies.
+        7. Provide 'bridge guidance' that explains exactly how the student can transition from their current answer to the ideal answer.
+        8. Suggest actionable resources or next steps for improvement.
+        9. Ensure the response is in valid JSON format matching the schema.
+
+        {format_instructions}
+        """
+
+        # 3. Setup LLM and Parser
+        parser = JsonOutputParser(pydantic_object=EvaluationSchema)
+        prompt = ChatPromptTemplate.from_template(template)
+        
+        # Use the configured model
+        llm = ChatGroq(
+            groq_api_key=GROQ_API_KEY,
+            model_name=GROQ_MODEL,
+            temperature=0.1
+        )
+
+        # 4. Create and run Chain
+        chain = prompt | llm | parser
+        
+        print(f"[PROCESS_EVAL] Invoking Groq LLM ({GROQ_MODEL}) for student: {student_name}")
+        result_dict = chain.invoke({
             "question": question,
-            "sample_solution": sample_solution,
-            "student_answer": student_answer,
+            "reference_guideline": reference_guideline or "No specific guideline found. Evaluate based on general academic standards and expert knowledge of the topic.",
             "rubric": rubric,
+            "student_answer": student_answer,
             "format_instructions": parser.get_format_instructions()
         })
-        
+
         if save_to_db and student_name:
-            save_evaluation_result(question, student_name, result, student_roll=student_roll)
+            save_evaluation_result(question, student_name, result_dict, student_roll=student_roll, student_answer=student_answer)
         
-        return result
+        return result_dict
     except Exception as e:
-        return {"error": f"Evaluation failed: {str(e)}"}
+        error_msg = str(e)
+        print(f"[EVAL_ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "score": "0",
+            "grade": "F",
+            "feedback": f"Evaluation error: {error_msg}",
+            "topic_diagnostic": "",
+            "rubric_breakdown": [],
+            "missing_concepts": [],
+            "bridge_guidance": f"An error occurred during evaluation: {error_msg}",
+            "suggested_resources": [],
+            "metadata": {
+                "complexity_level": "Unknown",
+                "ai_confidence": "0",
+                "plagiarism_similarity": "0"
+            }
+        }
 
 
 def evaluate_pdf(question: str, student_pdf_bytes: bytes, rubric: str, student_name: str = None, student_roll: str = None, save_to_db: bool = True):
     """Extract student answer text from PDF bytes and run evaluation pipeline."""
-    student_text = extract_text_from_pdf_bytes(student_pdf_bytes)
-    if not student_text:
-        raise RuntimeError("Failed to extract student text from PDF or PDF is empty.")
-    return process_assignment_evaluation(question, student_text, rubric, student_name=student_name, student_roll=student_roll, save_to_db=save_to_db)
+    try:
+        student_text = extract_text_from_pdf_bytes(student_pdf_bytes)
+        print(f"[EVALUATE_PDF] Extracted {len(student_text)} characters from PDF.")
+        if not student_text:
+            raise RuntimeError("Failed to extract student text from PDF or PDF is empty. For handwritten assignments, ensure the PDF is clear and Tesseract OCR is configured correctly.")
+        return process_assignment_evaluation(question, student_text, rubric, student_name=student_name, student_roll=student_roll, save_to_db=save_to_db)
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[EVALUATE_PDF_ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "score": "0",
+            "grade": "F",
+            "feedback": f"PDF Evaluation error: {error_msg}",
+            "topic_diagnostic": "",
+            "rubric_breakdown": [],
+            "missing_concepts": [],
+            "bridge_guidance": f"An error occurred: {error_msg}",
+            "suggested_resources": [],
+            "metadata": {
+                "complexity_level": "Unknown",
+                "ai_confidence": "0",
+                "plagiarism_similarity": "0"
+            }
+        }
 
 
 def store_guideline_from_pdf(pdf_bytes: bytes):

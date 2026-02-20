@@ -20,7 +20,14 @@ except Exception:
     _HAS_PDFPLUMBER = False
 
 try:
+    import pypdfium2 as pdfium
+    _HAS_PYPDFIUM2 = True
+except Exception:
+    _HAS_PYPDFIUM2 = False
+
+try:
     import pytesseract
+    from PIL import Image, ImageOps, ImageEnhance
     _HAS_PYTESSERACT = True
 except Exception:
     pytesseract = None
@@ -98,47 +105,118 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     if not pdf_bytes:
         return ""
 
+    print(f"[DEBUG] Starting PDF text extraction ({len(pdf_bytes)} bytes)")
+
     # Primary: PyPDF2
     if _HAS_PYPDF2:
         try:
+            print("[DEBUG] Attempting PyPDF2 extraction...")
             reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
             pages = [p.extract_text() or "" for p in reader.pages]
             combined = "\n".join(pages).strip()
-            if combined:
+            # If we got actual alphanumeric text, return it. Otherwise try fallback.
+            if any(c.isalnum() for c in combined):
+                print(f"[DEBUG] PyPDF2 success: extracted {len(combined)} chars")
                 return combined
-        except Exception:
+            print("[DEBUG] PyPDF2 returned no alphanumeric text.")
+        except Exception as e:
+            print(f"[DEBUG] PyPDF2 failed: {e}")
             logger.debug("PyPDF2 extraction failed, falling back", exc_info=True)
 
     # Fallback: pdfplumber text extraction
     if _HAS_PDFPLUMBER:
         try:
+            print("[DEBUG] Attempting pdfplumber extraction...")
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 texts = [p.extract_text() or "" for p in pdf.pages]
             combined = "\n".join(texts).strip()
-            if combined:
+            if any(c.isalnum() for c in combined):
+                print(f"[DEBUG] pdfplumber success: extracted {len(combined)} chars")
                 return combined
-        except Exception:
+            print("[DEBUG] pdfplumber returned no alphanumeric text.")
+        except Exception as e:
+            print(f"[DEBUG] pdfplumber failed: {e}")
             logger.debug("pdfplumber extraction failed", exc_info=True)
 
-    # Final fallback: OCR using pdfplumber to render pages + pytesseract
-    if _HAS_PDFPLUMBER and _HAS_PYTESSERACT:
-        try:
-            ocr_texts = []
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
-                    try:
-                        img = page.to_image(resolution=150)
-                        pil = img.original
-                        text = pytesseract.image_to_string(pil)
-                        ocr_texts.append(text or "")
-                    except Exception:
-                        logger.debug("OCR failed on a page", exc_info=True)
-                        ocr_texts.append("")
-            combined_ocr = "\n".join(ocr_texts).strip()
-            return combined_ocr
-        except Exception:
-            logger.exception("OCR extraction failed")
+    # Final fallback: OCR using pypdfium2 (preferred) or pdfplumber to render pages + pytesseract
+    if _HAS_PYTESSERACT:
+        print("[DEBUG] Attempting OCR fallback...")
+        ocr_texts = []
+        
+        # Method A: pypdfium2 (Higher quality rendering)
+        if _HAS_PYPDFIUM2:
+            try:
+                print("[DEBUG] Rendering pages with pypdfium2 for OCR...")
+                pdf = pdfium.PdfDocument(pdf_bytes)
+                for i in range(len(pdf)):
+                    print(f"[DEBUG] Processing page {i+1}/{len(pdf)}...")
+                    page = pdf[i]
+                    # Render at 300 DPI for better OCR
+                    bitmap = page.render(scale=300/72)
+                    pil = bitmap.to_pil()
+                    
+                    # Ensure white background (fix for transparent PDFs)
+                    if pil.mode in ('RGBA', 'LA'):
+                        background = Image.new('RGB', pil.size, (255, 255, 255))
+                        background.paste(pil, mask=pil.split()[-1])
+                        pil = background
+                    
+                    # Preprocess for handwriting
+                    pil = pil.convert('L') # Grayscale
+                    pil = ImageOps.autocontrast(pil) # Improve contrast
+                    
+                    # Optional: Enhance sharpness for clearer handwriting
+                    enhancer = ImageEnhance.Sharpness(pil)
+                    pil = enhancer.enhance(2.0)
+                    
+                    # Use PSM 3 (Auto) which is usually better for mixed handwriting
+                    text = pytesseract.image_to_string(pil, config='--psm 3')
+                    ocr_texts.append(text or "")
+                pdf.close()
+                combined_ocr = "\n".join(ocr_texts).strip()
+                if any(c.isalnum() for c in combined_ocr):
+                    print(f"[DEBUG] OCR success (pypdfium2): extracted {len(combined_ocr)} chars")
+                    return combined_ocr
+                print("[DEBUG] OCR (pypdfium2) returned no alphanumeric text.")
+            except Exception as e:
+                print(f"[DEBUG] pypdfium2 OCR failed: {e}")
+                logger.debug("pypdfium2 OCR fallback failed: %s", e)
 
+        # Method B: pdfplumber (Legacy fallback)
+        if _HAS_PDFPLUMBER:
+            try:
+                print("[DEBUG] Rendering pages with pdfplumber for OCR...")
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        try:
+                            print(f"[DEBUG] Processing page {i+1}/{len(pdf.pages)}...")
+                            # Higher resolution for better OCR
+                            img = page.to_image(resolution=300)
+                            pil = img.original
+                            
+                            # Preprocess
+                            pil = pil.convert('L')
+                            pil = ImageOps.autocontrast(pil)
+                            
+                            # Enhance sharpness
+                            enhancer = ImageEnhance.Sharpness(pil)
+                            pil = enhancer.enhance(2.0)
+                            
+                            text = pytesseract.image_to_string(pil, config='--psm 3')
+                            ocr_texts.append(text or "")
+                        except Exception as e:
+                            print(f"[DEBUG] OCR failed on page {i+1} with pdfplumber: {e}")
+                            logger.debug("OCR failed on matching page with pdfplumber", exc_info=True)
+                combined_ocr = "\n".join(ocr_texts).strip()
+                if any(c.isalnum() for c in combined_ocr):
+                    print(f"[DEBUG] OCR success (pdfplumber): extracted {len(combined_ocr)} chars")
+                    return combined_ocr
+                print("[DEBUG] OCR (pdfplumber) returned no alphanumeric text.")
+            except Exception as e:
+                print(f"[DEBUG] pdfplumber OCR failed: {e}")
+                logger.exception("OCR extraction via pdfplumber failed")
+
+    print("[DEBUG] All text extraction methods failed.")
     return ""
 
 
@@ -210,24 +288,10 @@ def parse_guideline_text(full_text: str) -> dict:
 
 
 def extract_and_parse_pdf(pdf_bytes: bytes) -> dict:
-    """Extract text from PDF bytes and parse into title/solution; also log the extracted text.
-
-    Returns dict: {title, solution, full_text, log_path}
+    """Extract text from PDF bytes and parse into title/solution.
+    
+    Returns dict: {title, solution, full_text}
     """
     full = extract_text_from_pdf_bytes(pdf_bytes)
     parsed = parse_guideline_text(full)
-
-    # write log
-    try:
-        logs_dir = _ensure_logs_dir()
-        import datetime
-        ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        safe_name = f"pdf_extracted_{ts}.txt"
-        path = os.path.join(logs_dir, safe_name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(parsed.get("full_text", ""))
-        parsed["log_path"] = path
-    except Exception:
-        parsed["log_path"] = None
-
     return parsed
